@@ -5,8 +5,10 @@ import { KeyringPair } from '@polkadot/keyring/types'; // eslint-disable-line
 import BlobModule from './modules/blob';
 import DIDModule from './modules/did';
 import RevocationModule from './modules/revocation';
+import PoAModule from './modules/poa';
+import TokenMigration from './modules/migration';
 import types from './types.json';
-
+import PoaRpcDefs from './poa-rpc-defs';
 
 import {
   PublicKey,
@@ -22,9 +24,12 @@ import {
 } from './signatures';
 
 /**
- * @typedef {object} Options The Options to use in the function createUser.
+ * @typedef {object} Options The Options to use in the function DockAPI.
  * @property {string} [address] The node address to connect to.
  * @property {object} [keyring] PolkadotJS keyring
+ * @property {object} [chainTypes] Types for the chain
+ * @property {object} [chainRpc] RPC definitions for the chain
+ * @property {Boolean} [loadPoaModules] Whether to load PoA modules or not. Defaults to true
  */
 
 /** Helper class to interact with the Dock chain */
@@ -40,33 +45,42 @@ class DockAPI {
   }
 
   /**
-   * Initialises the SDK and connects to the node
+   * Initializes the SDK and connects to the node
    * @param {Options} config - Configuration options
    * @return {Promise} Promise for when SDK is ready for use
    */
-  async init({ address, keyring } = {
+  async init({
+    address, keyring, chainTypes, chainRpc, loadPoaModules = true,
+  } = {
     address: null,
     keyring: null,
   }) {
     if (this.api) {
-      throw new Error('API is already connected');
+      if (this.api.isConnected) {
+        throw new Error('API is already connected');
+      } else {
+        this.disconnect();
+      }
     }
 
     this.address = address || this.address;
+    if (!this.address || this.address.indexOf('wss://') === -1) {
+      console.warn(`WARNING: Using non-secure endpoint: ${this.address}`);
+    }
 
-    // Polkadot-js needs these extra type information to work. Removing them will lead to
-    // an error. These were taken from substrate node frontend template.
-    const extraTypes = {
-      Address: 'AccountId',
-      LookupSource: 'AccountId',
-    };
+    // If RPC methods given, use them else set it to empty object.
+    let rpc = chainRpc || {};
+
+    // If using PoA module, extend the RPC methods with PoA specific ones.
+    if (loadPoaModules) {
+      rpc = Object.assign(rpc, PoaRpcDefs);
+    }
 
     this.api = await ApiPromise.create({
       provider: new WsProvider(this.address),
-      types: {
-        ...types,
-        ...extraTypes,
-      },
+      types: chainTypes || types,
+      // @ts-ignore: TS2322
+      rpc,
     });
 
     await this.initKeyring(keyring);
@@ -74,6 +88,11 @@ class DockAPI {
     this.blobModule = new BlobModule(this.api, this.signAndSend.bind(this));
     this.didModule = new DIDModule(this.api, this.signAndSend.bind(this));
     this.revocationModule = new RevocationModule(this.api, this.signAndSend.bind(this));
+
+    if (loadPoaModules) {
+      this.poaModule = new PoAModule(this.api);
+      this.migrationModule = new TokenMigration(this.api);
+    }
 
     return this.api;
   }
@@ -87,7 +106,9 @@ class DockAPI {
 
   async disconnect() {
     if (this.api) {
-      await this.api.disconnect();
+      if (this.api.isConnected) {
+        await this.api.disconnect();
+      }
       delete this.api;
       delete this.blobModule;
       delete this.didModule;
@@ -118,28 +139,42 @@ class DockAPI {
   /**
    * Signs an extrinsic with either the set account or a custom sign method (see constructor)
    * @param {object} extrinsic - Extrinsic to send
+   * @param {object} params - An object used to parameters like nonce, etc to the extrinsic
    * @return {Promise}
    */
-  async signExtrinsic(extrinsic) {
+  async signExtrinsic(extrinsic, params = {}) {
     if (this.customSignTx) {
-      await this.customSignTx(extrinsic, this);
+      await this.customSignTx(extrinsic, params, this);
     } else {
-      await extrinsic.signAsync(this.getAccount());
+      await extrinsic.signAsync(this.getAccount(), params);
     }
   }
 
   /**
    * Helper function to send transaction
    * @param {object} extrinsic - Extrinsic to send
+   * @param {Boolean} waitForFinalization - If true, waits for extrinsic's block to be finalized,
+   * else only wait to be included in block.
+   * @param {object} params - An object used to parameters like nonce, etc to the extrinsic
    * @return {Promise}
    */
-  async signAndSend(extrinsic) {
-    await this.signExtrinsic(extrinsic);
+  async signAndSend(extrinsic, waitForFinalization = true, params = {}) {
+    await this.signExtrinsic(extrinsic, params);
     const promise = new Promise((resolve, reject) => {
       try {
         let unsubFunc = null;
         return extrinsic.send(({ events = [], status }) => {
-          if (status.isFinalized) {
+          // If waiting for finalization
+          if (waitForFinalization && status.isFinalized) {
+            unsubFunc();
+            resolve({
+              events,
+              status,
+            });
+          }
+
+          // If not waiting for finalization, wait for inclusion in block.
+          if (!waitForFinalization && status.isInBlock) {
             unsubFunc();
             resolve({
               events,
@@ -160,8 +195,19 @@ class DockAPI {
       return this;
     });
 
-    const result = await promise;
-    return result;
+    return await promise;
+  }
+
+  /**
+   * Checks if the API instance is connected to the node
+   * @return {Boolean} The connection status
+   */
+  get isConnected() {
+    if (!this.api) {
+      return false;
+    }
+
+    return this.api.isConnected;
   }
 
   /**
@@ -196,6 +242,17 @@ class DockAPI {
     }
     return this.revocationModule;
   }
+
+  /**
+   * Get the PoA module
+   * @return {PoAModule} The module to use
+   */
+  get poa() {
+    if (!this.poa) {
+      throw new Error('Unable to get PoA module, SDK is not initialised');
+    }
+    return this.poaModule;
+  }
 }
 
 export default new DockAPI();
@@ -204,6 +261,7 @@ export {
   DockAPI,
   DIDModule,
   RevocationModule,
+  PoAModule,
   PublicKey,
   PublicKeySr25519,
   PublicKeyEd25519,

@@ -1,4 +1,4 @@
-import vcjs from 'vc-js';
+import vcjs from 'vc-js/lib';
 import { blake2AsHex } from '@polkadot/util-crypto';
 import { validate } from 'jsonschema';
 import * as jsonld from 'jsonld';
@@ -144,7 +144,10 @@ export function checkCredentialContext(credential) {
 function hasDockRevocation(status) {
   const id = status[credentialIDField];
   if (status
-    && jsonld.getValues(status, credentialTypeField).includes(RevRegType)
+    && (
+      jsonld.getValues(status, credentialTypeField).includes(RevRegType)
+      || jsonld.getValues(status, credentialTypeField).includes(`/${RevRegType}`)
+    )
     && id.startsWith(DockRevRegQualifier)
     && isHexWithGivenByteSize(id.slice(DockRevRegQualifier.length), RevRegIdByteSize)) {
     return true;
@@ -224,7 +227,9 @@ export async function verifyCredential(credential, {
   const expandedCredential = await expandJSONLD(credential);
 
   // Validate scheam
-  await getAndValidateSchemaIfPresent(expandedCredential, schemaApi, credential[credentialContextField]);
+  if (schemaApi) {
+    await getAndValidateSchemaIfPresent(expandedCredential, schemaApi, credential[credentialContextField]);
+  }
 
   // Run VCJS verifier
   const credVer = await vcjs.verifyCredential({
@@ -232,11 +237,15 @@ export async function verifyCredential(credential, {
     suite: [new Ed25519Signature2018(), new EcdsaSepc256k1Signature2019(), new Sr25519Signature2020()],
     documentLoader: documentLoader(resolver),
     compactProof,
+    async checkStatus() {
+      return { verified: true }; // To work with latest version, we check status elsewhere
+    },
   });
 
   // Check for revocation only if the credential is verified and revocation check is needed.
   if (credVer.verified && isRevocationCheckNeeded(expandedCredential, forceRevocationCheck, revocationApi)) {
     const revResult = await checkRevocationStatus(expandedCredential, revocationApi);
+
     // If revocation check fails, return the error else return the result of credential verification to avoid data loss.
     if (!revResult.verified) {
       return revResult;
@@ -314,6 +323,9 @@ export async function verifyPresentation(presentation, {
     domain,
     documentLoader: documentLoader(resolver),
     compactProof,
+    async checkStatus() {
+      return { verified: true }; // To work with latest version, we check status elsewhere
+    },
   });
 
   if (presVer.verified) {
@@ -332,8 +344,11 @@ export async function verifyPresentation(presentation, {
           return res;
         }
       }
-      // eslint-disable-next-line no-await-in-loop
-      await getAndValidateSchemaIfPresent(credential, schemaApi, presentation[credentialContextField]);
+
+      if (schemaApi) {
+        // eslint-disable-next-line no-await-in-loop
+        await getAndValidateSchemaIfPresent(credential, schemaApi, presentation[credentialContextField]);
+      }
     }
 
     // If all credentials pass the revocation check, the let the result of presentation verification be returned.
@@ -398,14 +413,16 @@ export async function validateCredentialSchema(credential, schema, context) {
 /**
  * Get schema and run validation on credential if it contains both a credentialSubject and credentialSchema
  * @param {object} credential - a verifiable credential JSON object
- * @param {object} [schemaApi] - An object representing a map. "schema type -> schema API". The API is used to get
+ * @param {object} schemaApi - An object representing a map. "schema type -> schema API". The API is used to get
  * a schema doc. For now, the object specifies the type as key and the value as the API, but the structure can change
  * as we support more APIs there are more details associated with each API. Only Dock is supported as of now.
+ * @param {object} context - the context
  * @returns {Promise<void>}
  */
 export async function getAndValidateSchemaIfPresent(credential, schemaApi, context) {
-  if (schemaApi) {
-    const schema = credential[expandedSchemaProperty][0];
+  const schemaList = credential[expandedSchemaProperty];
+  if (schemaList) {
+    const schema = schemaList[0];
     if (credential[expandedSubjectProperty] && schema) {
       if (!schemaApi.dock) {
         throw new Error('Only Dock schemas are supported as of now.');

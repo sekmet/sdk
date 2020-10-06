@@ -1,4 +1,4 @@
-import { stringToHex, u8aToString, u8aToHex } from '@polkadot/util';
+import { u8aToHex } from '@polkadot/util';
 import { canonicalize } from 'json-canonicalize';
 import { validate } from 'jsonschema';
 import axios from 'axios';
@@ -128,7 +128,7 @@ export default class Schema {
 
     return {
       id: getHexIdentifierFromBlobID(this.id),
-      blob: stringToHex(canonicalize(this.schema)),
+      blob: canonicalize(this.schema),
       author: getHexIdentifierFromDID(this.author),
     };
   }
@@ -139,8 +139,8 @@ export default class Schema {
    * @param {object} pair - The keypair to sign with
    * @return {Promise<object>} The extrinsic to sign and send.
    */
-  async writeToChain(dock, pair) {
-    return await dock.blob.new(this.toBlob(), pair);
+  async writeToChain(dock, pair, signature = undefined, waitForFinalization = true, params = {}) {
+    return await dock.blob.new(this.toBlob(), pair, signature, waitForFinalization, params);
   }
 
   /**
@@ -168,16 +168,16 @@ export default class Schema {
   static async get(id, dockApi) {
     const hexId = getHexIdentifierFromBlobID(id);
     const chainBlob = await dockApi.blob.get(hexId);
-    const blobStr = u8aToString(chainBlob[1]);
-    try {
-      const schema = JSON.parse(blobStr);
-      schema.id = id;
-      schema.author = hexDIDToQualified(u8aToHex(chainBlob[0]));
+    const chainValue = chainBlob[1];
 
-      return schema;
-    } catch (e) {
-      throw new Error(`Incorrect schema format: ${e}`);
+    if (typeof chainValue === 'object' && !(chainValue instanceof Uint8Array)) {
+      return {
+        ...chainValue,
+        id,
+        author: hexDIDToQualified(u8aToHex(chainBlob[0])),
+      };
     }
+    throw new Error('Incorrect schema format');
   }
 
   /**
